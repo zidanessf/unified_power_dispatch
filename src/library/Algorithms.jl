@@ -30,9 +30,11 @@ end
 function add_lower_bound(msro,t)
     lower_cut = AffExpr()
     for i in 1:length(msro.lower[t][:state])
-        p = dual(FixRef(msro.lower[t+1][:state][i].in))
-        msro.lower[t][:penalty] = max(msro.lower[t][:penalty],1.01*abs(p))#dynamic method
-        add_to_expression!(lower_cut,p * (msro.lower[t][:state][i].out - value(msro.lower[t+1][:state][i].in)))
+        if t >= msro.lower[t][:spread][i][1]
+            p = dual(FixRef(msro.lower[t+1][:state][i].in))
+            msro.lower[t][:penalty] = max(msro.lower[t][:penalty],1.01*abs(p))#dynamic method
+            add_to_expression!(lower_cut,p * (msro.lower[t][:state][i].out - value(msro.lower[t+1][:state][i].in)))
+        end
     end
     v_lower = objective_value(msro.lower[t+1])
     add_to_expression!(lower_cut,v_lower)
@@ -96,7 +98,7 @@ function ForwardPassPrimal(msro,start,stop)
     for t in start:stop #前推步骤
         # fix the dayahead decision
         for i in 1:length(msro.lower[t][:state])
-            if t > 1
+            if t > msro.lower[t][:spread][i][1]
                 fix(msro.upper[t][:state][i].in,value(msro.lower[t-1][:state][i].out))
                 fix(msro.lower[t][:state][i].in,value(msro.lower[t-1][:state][i].out))
             end
@@ -106,26 +108,30 @@ function ForwardPassPrimal(msro,start,stop)
         # else
         #     wst_vertex = vertex_enumeration_primal(msro,t)
         # end
-        if msro.config["use_maxmin_solver"]
-            solve_max_min(msro.uncertain[t],msro.upper[t],msro.uncertain[t][:uncertain],msro.upper[t][:uncertain],max_iteration=20,lipshitz_constant=2 * msro.config["initial_penalty"])
-            msro.upper[t][:wst_case] = value.(msro.uncertain[t][:uncertain])
-        else
-            wst_obj,wst_case = 0,[]
-            for wst in msro.upper[t][:vertex]
-                for i in 1:length(wst)
-                    fix(msro.upper[t][:uncertain][i],wst[i]; force=true)
+        if msro.uncertain[t][:is_uncertain]
+            if msro.config["use_maxmin_solver"]
+                solve_max_min(msro.uncertain[t],msro.upper[t],msro.uncertain[t][:uncertain],msro.upper[t][:uncertain],max_iteration=20,lipshitz_constant=2 * msro.config["initial_penalty"])
+                msro.upper[t][:wst_case] = value.(msro.uncertain[t][:uncertain])
+            else
+                wst_obj,wst_case = 0,[]
+                for wst in msro.upper[t][:vertex]
+                    for i in 1:length(wst)
+                        fix(msro.upper[t][:uncertain][i],wst[i]; force=true)
+                    end
+                    Suppressor.@suppress_out optimize!(msro.upper[t])
+                    @assert termination_status(msro.upper[t]) == MOI.OPTIMAL
+                    if objective_value(msro.upper[t]) > wst_obj
+                        wst_obj = objective_value(msro.upper[t])
+                        wst_case = wst
+                    end
                 end
-                Suppressor.@suppress_out optimize!(msro.upper[t])
-                @assert termination_status(msro.upper[t]) == MOI.OPTIMAL
-                if objective_value(msro.upper[t]) > wst_obj
-                    wst_obj = objective_value(msro.upper[t])
-                    wst_case = wst
-                end
+                msro.upper[t][:wst_case] = wst_case
+            end    
+            for i in 1:length(msro.upper[t][:wst_case])
+                fix(msro.lower[t][:uncertain][i],msro.upper[t][:wst_case][i]; force=true)
             end
-            msro.upper[t][:wst_case] = wst_case
-        end    
-        for i in 1:length(msro.upper[t][:wst_case])
-            fix(msro.lower[t][:uncertain][i],msro.upper[t][:wst_case][i]; force=true)
+        else # deterministic case
+            Suppressor.@suppress_out optimize!(msro.upper[t])
         end
         Suppressor.@suppress_out optimize!(msro.lower[t])
         @assert termination_status(msro.lower[t]) == MOI.OPTIMAL
@@ -147,30 +153,30 @@ function BackwardPassPrimal(msro,N_ITER,start,stop)
     for t in [stop-x+start for x in start+1:stop]#回代步骤
         # **update the overestimator**
             # **solve the updated upper problem**
-            # solve_max_min(msro.upper[t+1][:uncertain_problem],msro.upper[t+1],msro.upper[t+1][:uncertain_problem][:uncertain],msro.upper[t+1][:uncertain])
-            # wst_case = value.(msro.upper[t+1][:uncertain_problem][:uncertain])
-        if msro.config["use_maxmin_solver"]
-            solve_max_min(msro.uncertain[t+1],msro.upper[t+1],msro.uncertain[t+1][:uncertain],msro.upper[t+1][:uncertain],max_iteration=20,lipshitz_constant=2 * msro.config["initial_penalty"])
-            msro.upper[t+1][:wst_case] = value.(msro.uncertain[t+1][:uncertain])
-        else
-            wst_obj,wst_case = 0,[]
-            for wst in msro.upper[t+1][:vertex]
-                for i in 1:length(wst)
-                    fix(msro.upper[t+1][:uncertain][i],wst[i]; force=true)
+        if msro.uncertain[t+1][:is_uncertain]
+            if msro.config["use_maxmin_solver"]
+                solve_max_min(msro.uncertain[t+1],msro.upper[t+1],msro.uncertain[t+1][:uncertain],msro.upper[t+1][:uncertain],max_iteration=20,lipshitz_constant=2 * msro.config["initial_penalty"])
+                msro.upper[t+1][:wst_case] = value.(msro.uncertain[t+1][:uncertain])
+            else
+                wst_obj,wst_case = 0,[]
+                for wst in msro.upper[t+1][:vertex]
+                    for i in 1:length(wst)
+                        fix(msro.upper[t+1][:uncertain][i],wst[i]; force=true)
+                    end
+                    Suppressor.@suppress_out optimize!(msro.upper[t+1])
+                    @assert termination_status(msro.upper[t+1]) == MOI.OPTIMAL
+                    if objective_value(msro.upper[t+1]) >= wst_obj
+                        wst_obj = objective_value(msro.upper[t+1])
+                        wst_case = wst
+                    end
                 end
-                Suppressor.@suppress_out optimize!(msro.upper[t+1])
-                @assert termination_status(msro.upper[t+1]) == MOI.OPTIMAL
-                if objective_value(msro.upper[t+1]) >= wst_obj
-                    wst_obj = objective_value(msro.upper[t+1])
-                    wst_case = wst
-                end
+                msro.upper[t+1][:wst_case] = wst_case
             end
-            msro.upper[t+1][:wst_case] = wst_case
-        end
-        # wst_vertex = msro.upper[t+1][:wst_vertex]
-        for i in 1:length(msro.upper[t+1][:wst_case])
-            fix(msro.lower[t+1][:uncertain][i],msro.upper[t+1][:wst_case][i]; force=true)
-            fix(msro.upper[t+1][:uncertain][i],msro.upper[t+1][:wst_case][i]; force=true)
+            # wst_vertex = msro.upper[t+1][:wst_vertex]
+            for i in 1:length(msro.upper[t+1][:wst_case])
+                fix(msro.lower[t+1][:uncertain][i],msro.upper[t+1][:wst_case][i]; force=true)
+                fix(msro.upper[t+1][:uncertain][i],msro.upper[t+1][:wst_case][i]; force=true)
+            end
         end
         # **solve the updated lower problem**
         Suppressor.@suppress_out optimize!(msro.lower[t+1])
@@ -252,7 +258,7 @@ function train(msro)
     end
     return solution_status
 end
-function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,MaxIteration=100,MaxTime=3600,Gap=0.01,initial_penalty = 1e6,use_maxmin_solver=false)
+function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,MaxIteration=100,MaxTime=3600,Gap=0.01,initial_penalty = 1e6,use_maxmin_solver=false,start_stage=1)
     msro = Suppressor.@suppress_out MultiStageRobustModel(
         [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
         [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
@@ -263,10 +269,11 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
         m[:state] = []
         m[:initial_value] = []
         m[:uncertain] = []
+        m[:spread] = []
         # set_parameter(m[:uncertain_problem],"NonConvex",2)
         creator(m,t)
-        if t == 1
-            for i in 1:length(m[:state])
+        for i in 1:length(m[:state])
+            if t == m[:spread][i][1]
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
@@ -287,9 +294,10 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
         m[:state] = []
         m[:initial_value] = []
         m[:uncertain] = []
+        m[:spread] = []
         creator(m,t)
-        if t == 1
-            for i in 1:length(m[:state])
+        for i in 1:length(m[:state])
+            if t == m[:spread][i][1]
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
@@ -306,7 +314,14 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
         m[:state] = []
         m[:initial_value] = []
         m[:uncertain] = []
+        m[:spread] = []
         creator(m,t)
+        if isempty(m[:uncertain])
+            m[:is_uncertain] = false
+            continue
+        else
+            m[:is_uncertain] = true
+        end
         for v ∈ JuMP.all_variables(m) # delete non-uncertain variables
             if v ∉ m[:uncertain]
                 JuMP.delete(m,v)
@@ -323,9 +338,7 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
             end
         end
         m[:valid_cut] = [] # store cuts generated by max-min algorithm
-    end
-    for t in 1:N_stage # compute vertice
-        poly = Polyhedra.polyhedron(msro.uncertain[t], CDDLib.Library())
+        poly = Polyhedra.polyhedron(m, CDDLib.Library())# compute vertice
         msro.upper[t][:vertex] = [v for v in Polyhedra.points(Polyhedra.vrep(poly))]
     end
     # L1_regularization(msro)

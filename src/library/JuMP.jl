@@ -2,6 +2,7 @@ struct StateInfo
     in::JuMP.VariableInfo
     out::JuMP.VariableInfo
     initial_value::Float64
+    spread::UnitRange{Int64}
     kwargs
 end
 struct State{T}
@@ -24,6 +25,7 @@ function JuMP.build_variable(
     info::JuMP.VariableInfo,
     ::Type{State};
     initial_value = NaN,
+    spread = 1:1e8,
     kwargs...,
 )
     if isnan(initial_value)
@@ -31,6 +33,11 @@ function JuMP.build_variable(
             "When creating a state variable, you must set the " *
             "`initial_value` keyword to the value of the state variable at" *
             " the root node.",
+        )
+    end
+    if spread[1] < 1
+        _error(
+            "the start stage of a state variable must be at least 1",
         )
     end
     return StateInfo(
@@ -48,6 +55,7 @@ function JuMP.build_variable(
         ),
         info,
         initial_value,
+        spread,
         kwargs,
     )
 end
@@ -72,6 +80,7 @@ function JuMP.add_variable(subproblem::JuMP.Model, state_info::StateInfo, name::
     # @info(has_lower_bound(state.in))
     push!(subproblem[:state],state)
     push!(subproblem[:initial_value],state_info.initial_value)
+    push!(subproblem[:spread],state_info.spread)
     return state
 end
 function JuMP.add_variable(subproblem::JuMP.Model, state_info::UncertainInfo, name::String)

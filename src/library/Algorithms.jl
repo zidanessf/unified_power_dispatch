@@ -2,6 +2,8 @@ total_solves = 0
 number_of_reject = 0
 sceanio_not_change_num = 0
 FollowerValuePrev = 0
+t_stage1 = 0
+using CPLEX
 mutable struct MultiStageRobustModel
     upper::Array{JuMP.Model}
     lower::Array{JuMP.Model}
@@ -15,7 +17,7 @@ function add_upper_bound(msro,t,n_iter)
         @constraint(msro.upper[t],sum_y,dual_of_obj == 1)
     end
     v_upper = objective_value(msro.upper[t+1])
-    # v_upper = (objective_value(msro.lower[t+1]) + objective_value(msro.upper[t+1]))/2
+    # v_upper = sum(value(msro.upper[s][:cost_now]) for s in t+1:length(msro.upper))
     #modify objective
     set_normalized_coefficient(msro.upper[t][:upper_bound],dual_of_obj,-v_upper)
     # modify constraint  ∑y_k == 1
@@ -37,6 +39,7 @@ function add_lower_bound(msro,t)
         end
     end
     v_lower = objective_value(msro.lower[t+1])
+    # v_lower = sum(value(msro.lower[s][:cost_now]) for s in t+1:length(msro.lower))
     add_to_expression!(lower_cut,v_lower)
     @constraint(msro.lower[t],msro.lower[t][:cost_to_go] >= lower_cut)
 end
@@ -89,6 +92,8 @@ function solve_max_min(_max::JuMP.Model,_min::JuMP.Model,binder_max,binder_min;l
     end
 end
 function ForwardPassPrimal(msro,start,stop)
+    global t_stage1
+    t0 = time()
     additional = Dict()
     additional[:gaphourly] = []
     # additional[:upper] = []
@@ -118,6 +123,7 @@ function ForwardPassPrimal(msro,start,stop)
                     for i in 1:length(wst)
                         fix(msro.upper[t][:uncertain][i],wst[i]; force=true)
                     end
+                    # printstyled("____________upper problem_____________";color=:green)
                     Suppressor.@suppress_out optimize!(msro.upper[t])
                     @assert termination_status(msro.upper[t]) == MOI.OPTIMAL
                     if objective_value(msro.upper[t]) > wst_obj
@@ -130,23 +136,36 @@ function ForwardPassPrimal(msro,start,stop)
             for i in 1:length(msro.upper[t][:wst_case])
                 fix(msro.lower[t][:uncertain][i],msro.upper[t][:wst_case][i]; force=true)
             end
-        else # deterministic case
-            Suppressor.@suppress_out optimize!(msro.upper[t])
         end
+        # printstyled("____________lower problem_____________";color=:green)
         Suppressor.@suppress_out optimize!(msro.lower[t])
         @assert termination_status(msro.lower[t]) == MOI.OPTIMAL
         global total_solves
         total_solves += 2
         if t < length(msro.upper)
-            gapt  = value((msro.upper[t][:cost_to_go]) - value(msro.lower[t][:cost_to_go]))/value(msro.upper[t][:cost_to_go])
+            if msro.uncertain[t][:is_uncertain]
+                gapt  = (value(msro.upper[t][:cost_to_go]) - value(msro.lower[t][:cost_to_go]))/value(msro.upper[t][:cost_to_go])
+            else
+                gapt  = 0
+            end
         else
             gapt = 0
         end
         push!(additional[:gaphourly],round(gapt;digits=3))
+        if t == 1
+            t_stage1 += time() - t0
+        end
+        # @info(t1)    
     end
-    additional[:UpperBound] = objective_value(msro.upper[1])
-    additional[:LowerBound] = objective_value(msro.lower[1])
-    additional[:Gap] = (additional[:UpperBound] - additional[:LowerBound])/additional[:UpperBound]
+    if msro.uncertain[1][:is_uncertain]
+        additional[:UpperBound] = objective_value(msro.upper[1])
+        additional[:LowerBound] = objective_value(msro.lower[1])
+        additional[:Gap] = (additional[:UpperBound] - additional[:LowerBound])/additional[:UpperBound]
+    else
+        additional[:UpperBound] = objective_value(msro.upper[2])
+        additional[:LowerBound] = value(msro.lower[1][:cost_to_go])
+        additional[:Gap] = (objective_value(msro.upper[2]) - value(msro.lower[1][:cost_to_go]))/(value(msro.lower[1][:cost_to_go]) + 1e-8)
+    end
     return additional
 end
 function BackwardPassPrimal(msro,N_ITER,start,stop)
@@ -185,14 +204,17 @@ function BackwardPassPrimal(msro,N_ITER,start,stop)
         @assert termination_status(msro.lower[t+1]) == MOI.OPTIMAL
         global total_solves
         total_solves += 2
-        # intradayMaxtobj = value(msro.upper[t][:cost_to_go])
-        if objective_value(msro.upper[t+1]) <= value(msro.upper[t][:cost_to_go]) ||  N_ITER == 1
-            add_upper_bound(msro,t,N_ITER)
+        v_upper,v_lower = objective_value(msro.upper[t+1]),objective_value(msro.lower[t+1])
+        # v_upper,v_lower = sum(value(msro.upper[s][:cost_now]) for s in t+1:length(msro.upper)),sum(value(msro.lower[s][:cost_now]) for s in t+1:length(msro.lower))
+        if t > 1 || msro.uncertain[1][:is_uncertain]
+            if v_upper <= value(msro.upper[t][:cost_to_go]) ||  N_ITER == 1
+                add_upper_bound(msro,t,N_ITER)
+            end
         end
         # add_upper_bound(msro,t,N_ITER)
         # add_upper_bound(msro,t,N_ITER)
         # **update the underestimator**
-        if (objective_value(msro.lower[t+1]) >= value(msro.lower[t][:cost_to_go])) ||  N_ITER == 1
+        if (v_lower >= value(msro.lower[t][:cost_to_go])) ||  N_ITER == 1
             add_lower_bound(msro,t)
         end
         # @info(objective_value(msro.lower[t+1]),value(msro.lower[t][:cost_to_go]))
@@ -219,7 +241,8 @@ end
 
 function train(msro)
     n_iter = 0
-    global total_solves,sceanio_not_change_num
+    global total_solves,sceanio_not_change_num,t_stage1
+    t_stage1 = 0
     total_solves,sceanio_not_change_num,gap_temp,no_improvement = 0,0,9999,0
     start,stop = 1,length(msro.lower)
     additional = Dict()
@@ -229,13 +252,16 @@ function train(msro)
     t1 = time()
     while true
         n_iter += 1
+        for t in start:stop
+            set_optimizer(msro.lower[t],CPLEX.Optimizer)
+            set_optimizer(msro.upper[t],CPLEX.Optimizer)
+        end
         additional = ForwardPassPrimal(msro,start,stop)
         if n_iter >= 5
             stop = mature_stage(msro,additional)
             stop = max(stop,4)
         end
         # ______________________________________________________________________________________________________________
-        
         additional[:Iteration] = n_iter
         additional[:TotalSolves] = total_solves
         t2 = time()
@@ -256,12 +282,19 @@ function train(msro)
         end
         Suppressor.@suppress_out BackwardPassPrimal(msro,n_iter,start,stop)
     end
+    @info("stage 1 solve time: $t_stage1")
     return solution_status
 end
-function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,MaxIteration=100,MaxTime=3600,Gap=0.01,initial_penalty = 1e6,use_maxmin_solver=false,start_stage=1)
+function buildMultiStageRobustModel(creator::Function;
+    N_stage::Int,optimizer,
+    MaxIteration=100,
+    MaxTime=3600,
+    Gap=0.01,
+    initial_penalty = 1e6,
+    use_maxmin_solver=false)
     msro = Suppressor.@suppress_out MultiStageRobustModel(
-        [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
-        [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
+        [JuMP.Model(optimizer) for t in 1:N_stage],
+        [JuMP.Model(optimizer) for t in 1:N_stage],
         [JuMP.Model(with_optimizer(Ipopt.Optimizer)) for t in 1:N_stage],
         Dict([("MaxIteration",MaxIteration),("MaxTime",MaxTime),("Gap",Gap),("no_improvement",100),("initial_penalty",initial_penalty),("use_maxmin_solver",use_maxmin_solver)]))
     for t in 1:N_stage # construct upper bound problem
@@ -277,6 +310,7 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
+        m[:cost_now] = objective_function(m)
         if t < N_stage
             @variable(m,cost_to_go,lower_bound=0)
             @variable(m,τu[1:length(m[:state])],lower_bound=0)
@@ -301,6 +335,7 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
+        m[:cost_now] = objective_function(m)
         if t < N_stage
             @variable(m,cost_to_go,lower_bound=0)
             @objective(m,Min,objective_function(m) + cost_to_go)

@@ -1,8 +1,7 @@
 include("library/RDDP.jl")
-using .RDDP,Gurobi,PowerModels,CSV,Interpolations,DataFrames,Plots,PGFPlotsX
-pgfplotsx()
+using .RDDP,PowerModels,CSV,Interpolations,DataFrames,Plots,CPLEX
 # read input data
-const N_stage,K_seg,UT,DT,RU,RD = 25,5,4,4,1,1
+const N_stage,K_seg,UT,DT,RU,RD = 97,5,4,4,1,1
 silence()
 case = PowerModels.parse_file("datasets/case6ww.m")
 # wind_power,load = DataFrame(),DataFrame()
@@ -11,21 +10,24 @@ load = CSV.read("datasets/load_data.csv",DataFrame)[1:24,:load]
 gens = keys(case["gen"])
 loadmax = sum(max(case["gen"][gen]["pmax"],0) for gen in gens)
 load = load * loadmax/maximum(load)
+load_ipt = extrapolate(interpolate(load,BSpline(Linear())),Flat())
+load = [load_ipt(t*24/(N_stage-1)) for t in 2:N_stage]
 r = 0.65 * loadmax/maximum(wind_power[!,:wf1])
 alpha = 0.25
 wind_ipt1 = extrapolate(interpolate(wind_power[!,:wf1],BSpline(Linear())),Flat())
-Pw_max = [r*(1+alpha)*wind_ipt1(t*24/N_stage) for t in 1:N_stage]
-Pw_min = [r*(1-alpha)*wind_ipt1(t*24/N_stage) for t in 1:N_stage]
-Pw = [r*wind_ipt1(t*24/N_stage) for t in 1:N_stage]
+Pw_max = [r*(1+alpha)*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
+Pw_min = [r*(1-alpha)*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
+Pw = [r*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
 ess = [1,2]
 Emax,Emin,Pmax,E0 = [1,1],[0,0],[0.5,0.5],[0,0]
 msro = RDDP.buildMultiStageRobustModel(
     N_stage = N_stage,
-    optimizer = Gurobi.Optimizer,
+    optimizer = optimizer_with_attributes(
+        CPLEX.Optimizer, "CPX_PARAM_SIMDISPLAY" => 1
+    ),
     MaxIteration = 100,
-    MaxTime = 60,
-    Gap = 0.01,
-    start_stage = 2
+    MaxTime = 600,
+    Gap = 0.01
 ) do ro::JuMP.Model,t
     if t >= 2
         @variable(ro,pw_max,RDDP.Uncertain,lower_bound=Pw_min[t-1],upper_bound=Pw_max[t-1])
@@ -58,16 +60,16 @@ msro = RDDP.buildMultiStageRobustModel(
                     pk = case["gen"][gen]["pmax"]*k/K_seg
                     costk = (case["gen"][gen]["cost"][2])*pk + (case["gen"][gen]["cost"][1])*pk^2
                     ratek = 2*case["gen"][gen]["cost"][1]*pk
-                    @constraint(ro,Pgcost[gen] >= 24/N_stage * (costk + ratek*(Pg[gen].out - pk)))
+                    @constraint(ro,Pgcost[gen] >= 24/(N_stage-1) * (costk + ratek*(Pg[gen].out - pk)))
                 end
             elseif length(case["gen"][gen]["cost"]) == 2
-                @constraint(ro,Pgcost[gen] == 24/N_stage * case["gen"][gen]["cost"][1]*Pg[gen].out)
+                @constraint(ro,Pgcost[gen] == 24/(N_stage-1) * case["gen"][gen]["cost"][1]*Pg[gen].out)
             else
                 error("cost term must be 2 or 3")
             end
         end
         for e in ess # constraints of storages
-            @constraint(ro,Ses[e].out == Ses[e].in - Pes[e]) #state transition
+            @constraint(ro,Ses[e].out == Ses[e].in - 24/(N_stage-1)*Pes[e]) #state transition
             @constraint(ro,Ses[e].out <= Emax[e])
             @constraint(ro,Ses[e].out >= Emin[e])
         end

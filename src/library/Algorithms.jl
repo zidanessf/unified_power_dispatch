@@ -28,7 +28,6 @@ function add_upper_bound(msro,t,n_iter)
         set_normalized_coefficient(msro.upper[t][:sum_states][i],dual_of_obj, - value(msro.upper[t+1][:state][i].in))
     end
 end
-
 function add_lower_bound(msro,t)
     lower_cut = AffExpr()
     for i in 1:length(msro.lower[t][:state])
@@ -103,7 +102,7 @@ function ForwardPassPrimal(msro,start,stop)
     for t in start:stop #前推步骤
         # fix the dayahead decision
         for i in 1:length(msro.lower[t][:state])
-            if t > msro.lower[t][:spread][i][1]
+            if t > max(msro.lower[t][:spread][i][1],start)
                 fix(msro.upper[t][:state][i].in,value(msro.lower[t-1][:state][i].out))
                 fix(msro.lower[t][:state][i].in,value(msro.lower[t-1][:state][i].out))
             end
@@ -140,6 +139,9 @@ function ForwardPassPrimal(msro,start,stop)
         # printstyled("____________lower problem_____________";color=:green)
         Suppressor.@suppress_out optimize!(msro.lower[t])
         @assert termination_status(msro.lower[t]) == MOI.OPTIMAL
+        if t < length(msro.upper)
+            msro.lower[t][:cost_to_go_value] = value(msro.lower[t][:cost_to_go])
+        end
         global total_solves
         total_solves += 2
         if t < length(msro.upper)
@@ -157,14 +159,14 @@ function ForwardPassPrimal(msro,start,stop)
         end
         # @info(t1)    
     end
-    if msro.uncertain[1][:is_uncertain]
-        additional[:UpperBound] = objective_value(msro.upper[1])
-        additional[:LowerBound] = objective_value(msro.lower[1])
+    if msro.uncertain[start][:is_uncertain]
+        additional[:UpperBound] = objective_value(msro.upper[start])
+        additional[:LowerBound] = objective_value(msro.lower[start])
         additional[:Gap] = (additional[:UpperBound] - additional[:LowerBound])/additional[:UpperBound]
     else
-        additional[:UpperBound] = objective_value(msro.upper[2])
-        additional[:LowerBound] = value(msro.lower[1][:cost_to_go])
-        additional[:Gap] = (objective_value(msro.upper[2]) - value(msro.lower[1][:cost_to_go]))/(value(msro.lower[1][:cost_to_go]) + 1e-8)
+        additional[:UpperBound] = objective_value(msro.upper[start+1])
+        additional[:LowerBound] = value(msro.lower[start][:cost_to_go])
+        additional[:Gap] = (objective_value(msro.upper[start+1]) - value(msro.lower[start][:cost_to_go]))/(value(msro.lower[start][:cost_to_go]) + 1e-8)
     end
     return additional
 end
@@ -206,15 +208,14 @@ function BackwardPassPrimal(msro,N_ITER,start,stop)
         total_solves += 2
         v_upper,v_lower = objective_value(msro.upper[t+1]),objective_value(msro.lower[t+1])
         # v_upper,v_lower = sum(value(msro.upper[s][:cost_now]) for s in t+1:length(msro.upper)),sum(value(msro.lower[s][:cost_now]) for s in t+1:length(msro.lower))
-        if t > 1 || msro.uncertain[1][:is_uncertain]
-            if v_upper <= value(msro.upper[t][:cost_to_go]) ||  N_ITER == 1
-                add_upper_bound(msro,t,N_ITER)
-            end
-        end
-        # add_upper_bound(msro,t,N_ITER)
-        # add_upper_bound(msro,t,N_ITER)
+        # if t > 1 || msro.uncertain[1][:is_uncertain]
+        #     if 1.001 * v_upper < value(msro.upper[t][:cost_to_go]) ||  N_ITER == 1
+        #         add_upper_bound(msro,t,N_ITER)
+        #     end
+        # end
+        add_upper_bound(msro,t,N_ITER)
         # **update the underestimator**
-        if (v_lower >= value(msro.lower[t][:cost_to_go])) ||  N_ITER == 1
+        if (v_lower > 1.001 * msro.lower[t][:cost_to_go_value]) ||  N_ITER == 1
             add_lower_bound(msro,t)
         end
         # @info(objective_value(msro.lower[t+1]),value(msro.lower[t][:cost_to_go]))
@@ -227,8 +228,6 @@ function BackwardPassPrimal(msro,N_ITER,start,stop)
         end
     end
 end
-
-
 function mature_stage(msro,additional)
     if minimum(additional[:gaphourly][1:end-1]) < 0.01 && maximum(additional[:gaphourly][1:end-1]) < 0.2 
         stop = findfirst(x->x<=0.01,additional[:gaphourly][1:end-1])
@@ -238,12 +237,13 @@ function mature_stage(msro,additional)
     # @info("stop = $stop")
     return stop
 end
-
 function train(msro)
     n_iter = 0
     global total_solves,sceanio_not_change_num,t_stage1
+    msro.config["train_intraday"] = false
     t_stage1 = 0
     total_solves,sceanio_not_change_num,gap_temp,no_improvement = 0,0,9999,0
+    stage2value = -99999
     start,stop = 1,length(msro.lower)
     additional = Dict()
     solution_status = DataFrames.DataFrame(UpperBound=[],LowerBound=[],Gap=[],Time=[],TotalSolves=[]) 
@@ -257,32 +257,79 @@ function train(msro)
             set_optimizer(msro.upper[t],CPLEX.Optimizer)
         end
         additional = ForwardPassPrimal(msro,start,stop)
-        if n_iter >= 5
-            stop = mature_stage(msro,additional)
-            stop = max(stop,4)
-        end
         # ______________________________________________________________________________________________________________
         additional[:Iteration] = n_iter
         additional[:TotalSolves] = total_solves
         t2 = time()
         additional[:Time] = t2 - t1
         print_iteration(stdout,additional)
-        if n_iter >= 2
-            push!(solution_status,additional)
-        end
-        if n_iter >= msro.config["MaxIteration"] || additional[:Time] >= msro.config["MaxTime"] || no_improvement >= msro.config["no_improvement"] 
-            printstyled("Fail to converge. ";color=:red)
+        # quit condition
+        if n_iter >= msro.config["MaxIteration"] || additional[:Time] >= msro.config["MaxTime"] || no_improvement >= msro.config["no_improvement"]
+            if n_iter >= msro.config["MaxIteration"]
+                printstyled("Fail to converge. Maximum iterations reached ";color=:red)
+            elseif additional[:Time] >= msro.config["MaxTime"]
+                printstyled("Fail to converge. Maximum time reached";color=:red)
+            else
+                printstyled("Fail to converge. No further improvement";color=:red)
+            end
             print("$n_iter iterations in $(additional[:Time]) seconds. \n")
             break
         end
-        if n_iter >= 10 && (abs(additional[:Gap]) <= msro.config["Gap"] || stop == 1)
-            printstyled("Converged. ";color=:green)
+        if n_iter >= 10 && !msro.config["train_intraday"] && ((additional[:Gap]) <= msro.config["Gap"] || stop == 1)
+            printstyled("Converged with stage 1 bounds met. ";color=:green)
             print("$n_iter iterations in $(round(additional[:Time];digits=3)) seconds. \n")
             break
         end
+        # smart stage selection
+        if n_iter >= 5
+            stop = mature_stage(msro,additional)
+            stop = max(stop,4)
+        end
+        if n_iter >= 3 && msro.config["AutoStageSelection"]
+            if !msro.config["train_intraday"] && (solution_status[end,:LowerBound] - additional[:LowerBound])/additional[:LowerBound] <= 1e-4
+                no_improvement += 1
+            end
+            if msro.config["train_intraday"] && (additional[:UpperBound] - additional[:LowerBound])/additional[:LowerBound] <= 3e-2
+                no_improvement = 0
+                msro.config["train_intraday"] = false
+                if abs(additional[:LowerBound] - stage2value)/additional[:LowerBound] <= msro.config["Gap"]
+                    printstyled("Converged with stage 2 value not change. ";color=:green)
+                    print("$n_iter iterations in $(round(additional[:Time];digits=3)) seconds. \n")        
+                    break
+                else
+                    stage2value = additional[:LowerBound]
+                end
+                printstyled("---------------------training between stage 1 and 2...---------------\n")
+            end
+            if no_improvement >= 3
+                msro.config["train_intraday"] = true
+                no_improvement = 0
+                state_values = [value(msro.lower[1][:state][i].out) for i in 1:length(msro.lower[1][:state])]
+                while !isempty(msro.lower[1][:reg_cons])
+                    con = pop!(msro.lower[1][:reg_cons])
+                    delete(msro.lower[1],con)
+                end
+                for i in 1:length(msro.lower[1][:state])
+                    con1 = @constraint(msro.lower[1],msro.lower[1][:abs_state_variable][i] >= msro.lower[1][:state][i].out - state_values[i])
+                    con2 = @constraint(msro.lower[1],msro.lower[1][:abs_state_variable][i] >= - msro.lower[1][:state][i].out + state_values[i])
+                    push!(msro.lower[1][:reg_cons],con1)
+                    push!(msro.lower[1][:reg_cons],con2)
+                end
+                @objective(msro.lower[1],Min,msro.lower[1][:original_objective] + 20 * n_iter * sum(msro.lower[1][:abs_state_variable]))
+                printstyled("-------------------------fixing stage 1...---------------------------\n")
+            end
+            if msro.config["train_intraday"]
+                start = 2
+            else
+                start = 1
+            end
+        end
+        if n_iter >= 2
+            push!(solution_status,additional)
+        end
         Suppressor.@suppress_out BackwardPassPrimal(msro,n_iter,start,stop)
     end
-    @info("stage 1 solve time: $t_stage1")
+    # @info("stage 1 solve time: $t_stage1")
     return solution_status
 end
 function buildMultiStageRobustModel(creator::Function;
@@ -290,13 +337,20 @@ function buildMultiStageRobustModel(creator::Function;
     MaxIteration=100,
     MaxTime=3600,
     Gap=0.01,
-    initial_penalty = 1e6,
-    use_maxmin_solver=false)
+    initial_penalty = 1e8,
+    use_maxmin_solver=false,
+    AutoStageSelection=false)
     msro = Suppressor.@suppress_out MultiStageRobustModel(
         [JuMP.Model(optimizer) for t in 1:N_stage],
         [JuMP.Model(optimizer) for t in 1:N_stage],
         [JuMP.Model(with_optimizer(Ipopt.Optimizer)) for t in 1:N_stage],
-        Dict([("MaxIteration",MaxIteration),("MaxTime",MaxTime),("Gap",Gap),("no_improvement",100),("initial_penalty",initial_penalty),("use_maxmin_solver",use_maxmin_solver)]))
+        Dict([("MaxIteration",MaxIteration),
+        ("MaxTime",MaxTime),
+        ("Gap",Gap),
+        ("no_improvement",100),
+        ("initial_penalty",initial_penalty),
+        ("use_maxmin_solver",use_maxmin_solver),
+        ("AutoStageSelection",AutoStageSelection)]))
     for t in 1:N_stage # construct upper bound problem
         m = msro.upper[t]
         m[:state] = []
@@ -306,7 +360,7 @@ function buildMultiStageRobustModel(creator::Function;
         # set_parameter(m[:uncertain_problem],"NonConvex",2)
         creator(m,t)
         for i in 1:length(m[:state])
-            if t == m[:spread][i][1]
+            if t <= m[:spread][i][1]
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
@@ -341,6 +395,11 @@ function buildMultiStageRobustModel(creator::Function;
             @objective(m,Min,objective_function(m) + cost_to_go)
             m[:cost_to_go_now] = cost_to_go
         end
+        if t == 1
+            @variable(m,abs_state_variable[1:length(m[:state])],lower_bound=0)
+            m[:reg_cons] = []
+        end
+        m[:original_objective] = objective_function(m)
         m[:converging] = false
         m[:penalty] = 0.01
     end
@@ -384,14 +443,13 @@ function L1_regularization(msro::MultiStageRobustModel) # not working
         m = msro.lower[t]
         @variable(m,z_aux[1:length(m[:state])],lower_bound=0)
         @variable(m,z[1:length(m[:state])],lower_bound=0)
-        @objective(m,Min,objective_function(m) + 50000*sum(z_aux))
+        @objective(m,Min,objective_function(m) + 100000*sum(z_aux))
         for i in 1:length(m[:state])
             @constraint(m,z_aux[i] >= z[i] - m[:state][i].in)
             @constraint(m,z_aux[i] >= - z[i] + m[:state][i].in)
         end
     end
 end
-
 function evaluate_under_worst_case(msro,worst_case)
     total_cost = 0
     for t in 1:length(worst_case)

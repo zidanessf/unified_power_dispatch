@@ -5,7 +5,8 @@ N_stage,K_seg = 25,5
 RU,RD = 24/(N_stage-1),24/(N_stage-1)
 UT,DT = 4 * (N_stage-1)/24, 4 * (N_stage-1)/24
 silence()
-case = PowerModels.parse_file("datasets/case6ww.m")
+case = PowerModels.parse_file("datasets/pglib_opf_case118_ieee.m")
+# case = PowerModels.parse_file("datasets/case6ww.m")
 for gen in keys(case["gen"])
     case["gen"][gen]["pmin"] = max(case["gen"][gen]["pmin"],case["gen"][gen]["pmax"]*0.35)
 end
@@ -26,14 +27,14 @@ Pw = [r*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
 ess = [1,2]
 re = 0.2 * maximum(Pw)
 Emax,Emin,Pmax,E0 = re*[1,1],[0,0],re*[0.5,0.5],[0,0]
-msro = RDDP.buildMultiStageRobustModel(
+msro = @timev RDDP.buildMultiStageRobustModel(
     N_stage = N_stage,
     optimizer = optimizer_with_attributes(
         CPLEX.Optimizer
     ),
     MaxIteration = 1000,
     MaxTime = 600,
-    Gap = 0.01,
+    Gap = 0.005,
     AutoStageSelection = true
 ) do ro::JuMP.Model,t
     if t >= 2
@@ -110,11 +111,12 @@ msro = RDDP.buildMultiStageRobustModel(
         @objective(ro,Min,2000 * 24/(N_stage-1) * sum(sum(st_aux)))
     end
 end
-result = RDDP.train(msro)
+RDDP.train(msro)
+objectives,dist,min_obj,obj_std = RDDP.evaluate(msro)
 plot([[value(msro.lower[2][:st][gen,t].out) for t in 2:N_stage] for gen in gens],label=hcat(["G$gen" for gen in gens]...),marker=true)
 title!("Unit Commitment")
 xlabel!("Time(hour)")
 ylabel!("ON-OFF")
-plot([[value(msro.lower[t][:cost_to_go]) for t in 2:N_stage-1],[value(msro.upper[t][:cost_to_go]) for t in 2:N_stage-1]],label=["upper bound" "lower bound"])
+# plot([[value(msro.lower[t][:cost_to_go]) for t in 2:N_stage-1],[value(msro.upper[t][:cost_to_go]) for t in 2:N_stage-1]],label=["upper bound" "lower bound"])
 # plot([msro.lower[t][:penalty] for t in 1:N_stage])
 # TODO: do some comparison with AARUC and independent AARUC + RDDP via matlab xprog

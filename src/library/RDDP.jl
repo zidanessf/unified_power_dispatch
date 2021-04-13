@@ -15,6 +15,9 @@ import Polyhedra
 import CDDLib
 import DataFrames
 import Suppressor
+import Statistics
+import Distributions
+import NLsolve
 include("JuMP.jl")
 include("Algorithms.jl")
 include("print_iteration.jl")

@@ -1,9 +1,15 @@
 include("library/RDDP.jl")
 using .RDDP,PowerModels,CSV,Interpolations,DataFrames,Plots,CPLEX
 # read input data
-const N_stage,K_seg,UT,DT,RU,RD = 97,5,4,4,1,1
+N_stage,K_seg = 25,5
+RU,RD = 24/(N_stage-1),24/(N_stage-1)
+UT,DT = 4 * (N_stage-1)/24, 4 * (N_stage-1)/24
 silence()
-case = PowerModels.parse_file("datasets/case6ww.m")
+case = PowerModels.parse_file("datasets/pglib_opf_case118_ieee.m")
+# case = PowerModels.parse_file("datasets/case6ww.m")
+for gen in keys(case["gen"])
+    case["gen"][gen]["pmin"] = max(case["gen"][gen]["pmin"],case["gen"][gen]["pmax"]*0.35)
+end
 # wind_power,load = DataFrame(),DataFrame()
 wind_power = CSV.read("datasets/wind_2020.csv",DataFrame)[1:24,:]
 load = CSV.read("datasets/load_data.csv",DataFrame)[1:24,:load]
@@ -12,25 +18,27 @@ loadmax = sum(max(case["gen"][gen]["pmax"],0) for gen in gens)
 load = load * loadmax/maximum(load)
 load_ipt = extrapolate(interpolate(load,BSpline(Linear())),Flat())
 load = [load_ipt(t*24/(N_stage-1)) for t in 2:N_stage]
-r = 0.65 * loadmax/maximum(wind_power[!,:wf1])
-alpha = 0.25
+r = 0.6 * loadmax/maximum(wind_power[!,:wf1])
+alpha = 0.3
 wind_ipt1 = extrapolate(interpolate(wind_power[!,:wf1],BSpline(Linear())),Flat())
 Pw_max = [r*(1+alpha)*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
 Pw_min = [r*(1-alpha)*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
 Pw = [r*wind_ipt1(t*24/(N_stage-1)) for t in 2:N_stage]
 ess = [1,2]
-Emax,Emin,Pmax,E0 = [1,1],[0,0],[0.5,0.5],[0,0]
-msro = RDDP.buildMultiStageRobustModel(
+re = 0.2 * maximum(Pw)
+Emax,Emin,Pmax,E0 = re*[1,1],[0,0],re*[0.5,0.5],[0,0]
+msro = @timev RDDP.buildMultiStageRobustModel(
     N_stage = N_stage,
     optimizer = optimizer_with_attributes(
-        CPLEX.Optimizer, "CPX_PARAM_SIMDISPLAY" => 1
+        CPLEX.Optimizer
     ),
-    MaxIteration = 100,
+    MaxIteration = 1000,
     MaxTime = 600,
-    Gap = 0.01
+    Gap = 0.005,
+    AutoStageSelection = true
 ) do ro::JuMP.Model,t
     if t >= 2
-        @variable(ro,pw_max,RDDP.Uncertain,lower_bound=Pw_min[t-1],upper_bound=Pw_max[t-1])
+        @variable(ro,pw_max,RDDP.Uncertain,lowesr_bound=Pw_min[t-1],upper_bound=Pw_max[t-1])
     end
     # defining operator's strategy
     @variable(ro,Pg[gen in gens],RDDP.State,initial_value = case["gen"][gen]["pmin"],spread = 2:N_stage)
@@ -64,6 +72,8 @@ msro = RDDP.buildMultiStageRobustModel(
                 end
             elseif length(case["gen"][gen]["cost"]) == 2
                 @constraint(ro,Pgcost[gen] == 24/(N_stage-1) * case["gen"][gen]["cost"][1]*Pg[gen].out)
+            elseif length(case["gen"][gen]["cost"]) == 0
+                nothing
             else
                 error("cost term must be 2 or 3")
             end
@@ -98,11 +108,15 @@ msro = RDDP.buildMultiStageRobustModel(
                 end
             end
         end
-        @objective(ro,Min,2000 * sum(sum(st_aux)))
+        @objective(ro,Min,2000 * 24/(N_stage-1) * sum(sum(st_aux)))
     end
 end
 RDDP.train(msro)
-plot([[value(msro.lower[1][:st][gen,t].out) for t in 2:N_stage] for gen in gens],label=hcat(["G$gen" for gen in gens]...),marker=true)
+objectives,dist,min_obj,obj_std = RDDP.evaluate(msro)
+plot([[value(msro.lower[2][:st][gen,t].out) for t in 2:N_stage] for gen in gens],label=hcat(["G$gen" for gen in gens]...),marker=true)
 title!("Unit Commitment")
 xlabel!("Time(hour)")
 ylabel!("ON-OFF")
+# plot([[value(msro.lower[t][:cost_to_go]) for t in 2:N_stage-1],[value(msro.upper[t][:cost_to_go]) for t in 2:N_stage-1]],label=["upper bound" "lower bound"])
+# plot([msro.lower[t][:penalty] for t in 1:N_stage])
+# TODO: do some comparison with AARUC and independent AARUC + RDDP via matlab xprog

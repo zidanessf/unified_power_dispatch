@@ -8,7 +8,7 @@ function print_banner(io)
         io,
         "--------------------------------------------------------------------------------",
     )
-    printstyled(io, "                     fast Robust Dual Dynamic Programming (fRDDP) (c) Yunhui Shi, 2021\n";color=:red)
+    printstyled(io, "    Stochastic Robust Dual Dynamic Programming (SRDDP) (c) Yunhui Shi, 2021\n";color=:red)
     println(io)
 end
 function print_banner_v2(io)
@@ -22,7 +22,7 @@ end
 function print_iteration_header(io)
     println(
         io,
-        " Iteration    UpperBound       LowerBound        Gap       Time (s)       # Solves",
+        " Iteration    LowerBound        mean           std        Time (s)       # Solves",
     )
 end
 function print_iteration_header_v2(io)
@@ -36,9 +36,9 @@ print_value(x::Int) = Printf.@sprintf("%9d", x)
 
 function print_iteration(io, additional::Dict)
     print(io, print_value(additional[:Iteration]))
-    print(io, "   ", print_value(additional[:UpperBound]))
     print(io, "  ", print_value(additional[:LowerBound]))
-    print(io, "  ", print_value(additional[:Gap]))
+    print(io, "  ", print_value(additional[:mean]))
+    print(io, "  ", print_value(additional[:std]))
     print(io, "  ", print_value(additional[:Time]))
     print(io, "  ", print_value(additional[:TotalSolves]))
     println(io)
